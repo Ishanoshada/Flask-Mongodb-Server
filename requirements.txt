@@ -1,2 +1,5 @@
 flask
 pymongo
+eventlet
+flask-socketio
+flask-cors

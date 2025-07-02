@@ -1,195 +1,209 @@
 from flask import Flask, request, jsonify
+from flask_socketio import SocketIO, emit, join_room
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, ConfigurationError
-import json
+from urllib.parse import urlparse
+import logging
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your_secret_key'
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-@app.route('/')
-def index():
-    """Return a simple welcome message."""
-    return jsonify({'message': 'Welcome to the MongoDB API. Use /mongodb endpoint for operations.'})
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+
+def get_mongo_client(uri):
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        client.admin.command('ping')  # Test connection
+        return client
+    except Exception as e:
+        logging.error(f"MongoDB connection failed: {str(e)}")
+        return None
 
 @app.route('/mongodb', methods=['POST'])
-def mongodb_create_insert_find():
-    """Handle MongoDB create, insert, and find operations via HTTP POST requests."""
+def handle_mongodb_post():
     try:
-        # Extract URI and query from JSON body
         data = request.get_json()
-        if not data or 'uri' not in data or 'query' not in data:
-            return jsonify({'error': 'Missing uri or query in JSON body'}), 400
-
-        uri = data['uri']
-        query = data['query']
-
-        # Validate query structure
-        required_keys = ['db', 'collection', 'operation']
-        if not all(key in query for key in required_keys):
-            return jsonify({'error': 'Query must include db, collection, and operation'}), 400
-
-        # Connect to MongoDB
-        try:
-            client = MongoClient(uri, serverSelectionTimeoutMS=5000)
-            client.admin.command('ping')  # Test connection
-        except (ConnectionFailure, ConfigurationError) as e:
-            return jsonify({'error': f'Failed to connect to MongoDB: {str(e)}'}), 500
-
-        # Access database
-        db_name = query['db']
-        collection_name = query['collection']
-        operation = query['operation']
-        db = client[db_name]
+        uri = data.get('uri')
+        query = data.get('query')
+        if not uri or not query:
+            return jsonify({'status': 'error', 'error': 'Missing uri or query'}), 400
         
-        # For create operation, collection is created below if needed
-        if operation != 'create':
-            collection = db[collection_name]
-
-        # Execute the requested operation
-        try:
-            if operation == 'create':
-                # Check if collection exists; create if it doesn't
-                if collection_name not in db.list_collection_names():
-                    db.create_collection(collection_name)
-                    return jsonify({'message': f'Collection {collection_name} created in database {db_name}'}), 200
-                else:
-                    return jsonify({'message': f'Collection {collection_name} already exists in database {db_name}'}), 200
-
-            elif operation == 'insert':
-                if 'data' not in query:
-                    return jsonify({'error': 'Insert operation requires data'}), 400
-                data = query['data']
-                # Handle single document or list of documents
-                if isinstance(data, list):
-                    result = collection.insert_many(data)
-                    return jsonify({'inserted_ids': [str(id) for id in result.inserted_ids]}), 200
-                else:
-                    result = collection.insert_one(data)
-                    return jsonify({'inserted_id': str(result.inserted_id)}), 200
-
-            elif operation == 'find':
-                if 'filter' not in query:
-                    return jsonify({'error': 'Find operation requires a filter'}), 400
-                results = list(collection.find(query['filter']))
-                # Convert ObjectId to string for JSON serialization
-                for result in results:
-                    if '_id' in result:
-                        result['_id'] = str(result['_id'])
-                return jsonify({'results': results}), 200
-
+        client = get_mongo_client(uri)
+        if not client:
+            return jsonify({'status': 'error', 'error': 'Failed to connect to MongoDB'}), 500
+        
+        db_name = query.get('db')
+        collection_name = query.get('collection')
+        operation = query.get('operation')
+        db = client[db_name]
+        collection = db[collection_name]
+        
+        if operation == 'create':
+            # Create collection if it doesn't exist
+            if collection_name not in db.list_collection_names():
+                db.create_collection(collection_name)
+                result = {'status': 'success', 'message': f'Collection {collection_name} created'}
             else:
-                return jsonify({'error': f'Unsupported operation: {operation}'}), 400
-
-        except Exception as e:
-            return jsonify({'error': f'Query execution failed: {str(e)}'}), 500
-
+                result = {'status': 'success', 'message': f'Collection {collection_name} already exists'}
+        
+        elif operation == 'find':
+            filter_query = query.get('filter', {})
+            results = list(collection.find(filter_query))
+            for doc in results:
+                doc['_id'] = str(doc['_id'])
+            result = {'status': 'success', 'results': results}
+        
+        elif operation == 'insert':
+            data = query.get('data')
+            inserted = collection.insert_one(data)
+            result = {'status': 'success', 'inserted_id': str(inserted.inserted_id)}
+        
+        else:
+            return jsonify({'status': 'error', 'error': 'Unsupported operation'}), 400
+        
+        client.close()
+        return jsonify(result)
     except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
-
-    finally:
-        # Ensure MongoDB client is closed
-        if 'client' in locals():
-            client.close()
+        logging.error(f"Error in POST /mongodb: {str(e)}")
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 @app.route('/mongodb', methods=['PUT'])
-def mongodb_update():
-    """Handle MongoDB update operation via HTTP PUT requests."""
+def handle_mongodb_put():
     try:
-        # Extract URI and query from JSON body
         data = request.get_json()
-        if not data or 'uri' not in data or 'query' not in data:
-            return jsonify({'error': 'Missing uri or query in JSON body'}), 400
-
-        uri = data['uri']
-        query = data['query']
-
-        # Validate query structure
-        required_keys = ['db', 'collection', 'operation', 'filter', 'update']
-        if not all(key in query for key in required_keys):
-            return jsonify({'error': 'Query must include db, collection, operation, filter, and update'}), 400
-
-        if query['operation'] != 'update':
-            return jsonify({'error': 'PUT method only supports update operation'}), 400
-
-        # Connect to MongoDB
-        try:
-            client = MongoClient(uri, serverSelectionTimeoutMS=5000)
-            client.admin.command('ping')  # Test connection
-        except (ConnectionFailure, ConfigurationError) as e:
-            return jsonify({'error': f'Failed to connect to MongoDB: {str(e)}'}), 500
-
-        # Access database and collection
-        db_name = query['db']
-        collection_name = query['collection']
+        uri = data.get('uri')
+        query = data.get('query')
+        if not uri or not query:
+            return jsonify({'status': 'error', 'error': 'Missing uri or query'}), 400
+        
+        client = get_mongo_client(uri)
+        if not client:
+            return jsonify({'status': 'error', 'error': 'Failed to connect to MongoDB'}), 500
+        
+        db_name = query.get('db')
+        collection_name = query.get('collection')
+        operation = query.get('operation')
         db = client[db_name]
         collection = db[collection_name]
-
-        # Execute update operation
-        try:
-            result = collection.update_many(query['filter'], query['update'])
-            return jsonify({
-                'matched_count': result.matched_count,
-                'modified_count': result.modified_count
-            }), 200
-
-        except Exception as e:
-            return jsonify({'error': f'Query execution failed: {str(e)}'}), 500
-
+        
+        if operation == 'update':
+            filter_query = query.get('filter', {})
+            update_data = query.get('update', {})
+            result = collection.update_one(filter_query, update_data)
+            result = {'status': 'success', 'matched_count': result.matched_count, 'modified_count': result.modified_count}
+        
+        else:
+            return jsonify({'status': 'error', 'error': 'Unsupported operation'}), 400
+        
+        client.close()
+        return jsonify(result)
     except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
-
-    finally:
-        # Ensure MongoDB client is closed
-        if 'client' in locals():
-            client.close()
+        logging.error(f"Error in PUT /mongodb: {str(e)}")
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 @app.route('/mongodb', methods=['DELETE'])
-def mongodb_delete():
-    """Handle MongoDB delete operation via HTTP DELETE requests."""
+def handle_mongodb_delete():
     try:
-        # Extract URI and query from JSON body
         data = request.get_json()
-        if not data or 'uri' not in data or 'query' not in data:
-            return jsonify({'error': 'Missing uri or query in JSON body'}), 400
-
-        uri = data['uri']
-        query = data['query']
-
-        # Validate query structure
-        required_keys = ['db', 'collection', 'operation', 'filter']
-        if not all(key in query for key in required_keys):
-            return jsonify({'error': 'Query must include db, collection, operation, and filter'}), 400
-
-        if query['operation'] != 'delete':
-            return jsonify({'error': 'DELETE method only supports delete operation'}), 400
-
-        # Connect to MongoDB
-        try:
-            client = MongoClient(uri, serverSelectionTimeoutMS=5000)
-            client.admin.command('ping')  # Test connection
-        except (ConnectionFailure, ConfigurationError) as e:
-            return jsonify({'error': f'Failed to connect to MongoDB: {str(e)}'}), 500
-
-        # Access database and collection
-        db_name = query['db']
-        collection_name = query['collection']
+        uri = data.get('uri')
+        query = data.get('query')
+        if not uri or not query:
+            return jsonify({'status': 'error', 'error': 'Missing uri or query'}), 400
+        
+        client = get_mongo_client(uri)
+        if not client:
+            return jsonify({'status': 'error', 'error': 'Failed to connect to MongoDB'}), 500
+        
+        db_name = query.get('db')
+        collection_name = query.get('collection')
+        operation = query.get('operation')
         db = client[db_name]
         collection = db[collection_name]
-
-        # Execute delete operation
-        try:
-            result = collection.delete_many(query['filter'])
-            return jsonify({'deleted_count': result.deleted_count}), 200
-
-        except Exception as e:
-            return jsonify({'error': f'Query execution failed: {str(e)}'}), 500
-
+        
+        if operation == 'delete':
+            filter_query = query.get('filter', {})
+            result = collection.delete_one(filter_query)
+            result = {'status': 'success', 'deleted_count': result.deleted_count}
+        
+        else:
+            return jsonify({'status': 'error', 'error': 'Unsupported operation'}), 400
+        
+        client.close()
+        return jsonify(result)
     except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        logging.error(f"Error in DELETE /mongodb: {str(e)}")
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
-    finally:
-        # Ensure MongoDB client is closed
-        if 'client' in locals():
-            client.close()
+@socketio.on('connect', namespace='/mongodb')
+def handle_connect(auth):
+    join_room(request.sid)
+    logging.debug(f"Client connected: {request.sid}")
+    emit('connect_response', {'status': 'success', 'message': 'Connected to MongoDB namespace'}, room=request.sid)
+
+@socketio.on('disconnect', namespace='/mongodb')
+def handle_disconnect():
+    logging.debug(f"Client disconnected: {request.sid}")
+
+@socketio.on('mongodb', namespace='/mongodb')
+def handle_mongodb_event(data):
+    try:
+        uri = data.get('uri')
+        query = data.get('query')
+        if not uri or not query:
+            emit('response', {'status': 'error', 'error': 'Missing uri or query'}, room=request.sid)
+            return
+        
+        client = get_mongo_client(uri)
+        if not client:
+            emit('response', {'status': 'error', 'error': 'Failed to connect to MongoDB'}, room=request.sid)
+            return
+        
+        db_name = query.get('db')
+        collection_name = query.get('collection')
+        operation = query.get('operation')
+        db = client[db_name]
+        collection = db[collection_name]
+        
+        if operation == 'create':
+            if collection_name not in db.list_collection_names():
+                db.create_collection(collection_name)
+                result = {'status': 'success', 'message': f'Collection {collection_name} created'}
+            else:
+                result = {'status': 'success', 'message': f'Collection {collection_name} already exists'}
+        
+        elif operation == 'find':
+            filter_query = query.get('filter', {})
+            results = list(collection.find(filter_query))
+            for doc in results:
+                doc['_id'] = str(doc['_id'])
+            result = {'status': 'success', 'results': results}
+        
+        elif operation == 'insert':
+            data = query.get('data')
+            inserted = collection.insert_one(data)
+            result = {'status': 'success', 'inserted_id': str(inserted.inserted_id)}
+        
+        elif operation == 'update':
+            filter_query = query.get('filter', {})
+            update_data = query.get('update', {})
+            result = collection.update_one(filter_query, update_data)
+            result = {'status': 'success', 'matched_count': result.matched_count, 'modified_count': result.modified_count}
+        
+        elif operation == 'delete':
+            filter_query = query.get('filter', {})
+            result = collection.delete_one(filter_query)
+            result = {'status': 'success', 'deleted_count': result.deleted_count}
+        
+        else:
+            emit('response', {'status': 'error', 'error': 'Unsupported operation'}, room=request.sid)
+            return
+        
+        client.close()
+        emit('response', result, room=request.sid)
+    except Exception as e:
+        logging.error(f"Error in WebSocket mongodb event: {str(e)}")
+        emit('response', {'status': 'error', 'error': str(e)}, room=request.sid)
 
 if __name__ == '__main__':
-    app.run()
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
